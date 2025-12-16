@@ -1,3 +1,13 @@
+/*
+	IR protocols example
+
+	This example code is in the Public Domain (or CC0 licensed, at your option.)
+
+	Unless required by applicable law or agreed to in writing, this
+	software is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
+	CONDITIONS OF ANY KIND, either express or implied.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,22 +20,17 @@
 #include "esp_system.h"
 #include "esp_vfs.h"
 #include "esp_spiffs.h"
-#include "driver/rmt.h"
-#include "ir_tools.h"
+#include "driver/rmt_tx.h"
+#include "ir_nec_encoder.h"
 
+#define EXAMPLE_IR_RESOLUTION_HZ 1000000 // 1MHz resolution, 1 tick = 1us
 
 #define GPIO_INPUT GPIO_NUM_39
-#define RMT_TX_CHANNEL 1 /*!< RMT channel for transmitter */
 #define RMT_TX_GPIO_NUM	GPIO_NUM_12 /*!< GPIO number for transmitter signal */
 #define MAX_CONFIG 20
 #define MAX_CHARACTER 16
 
-
-#define CMD_UP 100
-#define CMD_DOWN 200
-#define CMD_TOP 300
-#define CMD_BOTTOM 400
-#define CMD_SELECT 500
+typedef enum {CMD_UP, CMD_DOWN, CMD_TOP, CMD_BOTTOM, CMD_SELECT} COMMAND;
 
 QueueHandle_t xQueueCmd;
 
@@ -44,7 +49,7 @@ typedef struct {
 } DISPLAY_t;
 
 
-static void SPIFFS_Directory(char * path) {
+static void listSPIFFS(char * path) {
 	DIR* dir = opendir(path);
 	assert(dir != NULL);
 	while (true) {
@@ -55,7 +60,53 @@ static void SPIFFS_Directory(char * path) {
 	closedir(dir);
 }
 
-void buttonStick(void *pvParameters)
+esp_err_t mountSPIFFS(char * path, char * label, int max_files) {
+	esp_vfs_spiffs_conf_t conf = {
+		.base_path = path,
+		.partition_label = label,
+		.max_files = max_files,
+		.format_if_mount_failed = true
+	};
+
+	// Use settings defined above to initialize and mount SPIFFS filesystem.
+	// Note: esp_vfs_spiffs_register is an all-in-one convenience function.
+	esp_err_t ret = esp_vfs_spiffs_register(&conf);
+
+	if (ret != ESP_OK) {
+		if (ret ==ESP_FAIL) {
+			ESP_LOGE(TAG, "Failed to mount or format filesystem");
+		} else if (ret== ESP_ERR_NOT_FOUND) {
+			ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+		} else {
+			ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)",esp_err_to_name(ret));
+		}
+		return ret;
+	}
+
+#if 0
+	ESP_LOGI(TAG, "Performing SPIFFS_check().");
+	ret = esp_spiffs_check(conf.partition_label);
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "SPIFFS_check() failed (%s)", esp_err_to_name(ret));
+		return ret;
+	} else {
+			ESP_LOGI(TAG, "SPIFFS_check() successful");
+	}
+#endif
+
+	size_t total = 0, used = 0;
+	ret = esp_spiffs_info(conf.partition_label, &total, &used);
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG,"Failed to get SPIFFS partition information (%s)",esp_err_to_name(ret));
+	} else {
+		ESP_LOGI(TAG,"Mount %s to %s success", path, label);
+		ESP_LOGI(TAG,"Partition size: total: %d, used: %d", total, used);
+	}
+
+	return ret;
+}
+
+void buttonAtom(void *pvParameters)
 {
 	ESP_LOGI(pcTaskGetName(0), "Start");
 	CMD_t cmdBuf;
@@ -63,8 +114,12 @@ void buttonStick(void *pvParameters)
 	cmdBuf.command = CMD_SELECT;
 
 	// set the GPIO as a input
-	gpio_reset_pin(GPIO_INPUT);
-	gpio_set_direction(GPIO_INPUT, GPIO_MODE_DEF_INPUT);
+	//gpio_reset_pin(GPIO_INPUT);
+	//gpio_set_direction(GPIO_INPUT, GPIO_MODE_DEF_INPUT);
+	gpio_config_t io_conf = {};
+	io_conf.mode = GPIO_MODE_INPUT;
+	io_conf.pin_bit_mask = (1ULL<<GPIO_INPUT);
+	gpio_config(&io_conf);
 
 	while(1) {
 		int level = gpio_get_level(GPIO_INPUT);
@@ -80,7 +135,6 @@ void buttonStick(void *pvParameters)
 		vTaskDelay(1);
 	}
 }
-
 
 static int parseLine(char *line, int size1, int size2, char arr[size1][size2])
 {
@@ -132,7 +186,6 @@ static int parseLine(char *line, int size1, int size2, char arr[size1][size2])
 	return dst;
 }
 
-
 static int readDefineFile(DISPLAY_t *display, size_t maxLine, size_t maxText) {
 	int readLine = 0;
 	ESP_LOGI(pcTaskGetName(0), "Reading file:maxText=%d",maxText);
@@ -171,20 +224,53 @@ static int readDefineFile(DISPLAY_t *display, size_t maxLine, size_t maxText) {
 	return readLine;
 }
 
+void initializeRMT(rmt_channel_handle_t *tx_channel, rmt_encoder_handle_t *nec_encoder, rmt_transmit_config_t *transmit_config) {
+	// Setup IR transmitter
+	ESP_LOGI(TAG, "create RMT TX channel");
+	rmt_tx_channel_config_t _tx_channel_cfg = {
+		.clk_src = RMT_CLK_SRC_DEFAULT,
+		.resolution_hz = EXAMPLE_IR_RESOLUTION_HZ,
+		.mem_block_symbols = 64, // amount of RMT symbols that the channel can store at a time
+		.trans_queue_depth = 4,  // number of transactions that allowed to pending in the background, this example won't queue multiple transactions, so queue depth > 1 is sufficient
+		.gpio_num = RMT_TX_GPIO_NUM,
+	};
+	rmt_channel_handle_t _tx_channel = NULL;
+	ESP_ERROR_CHECK(rmt_new_tx_channel(&_tx_channel_cfg, &_tx_channel));
+
+	ESP_LOGI(TAG, "modulate carrier to TX channel");
+	rmt_carrier_config_t _carrier_cfg = {
+		.duty_cycle = 0.33,
+		.frequency_hz = 38000, // 38KHz
+	};
+	ESP_ERROR_CHECK(rmt_apply_carrier(_tx_channel, &_carrier_cfg));
+
+	// this example won't send NEC frames in a loop
+	rmt_transmit_config_t _transmit_config = {
+		.loop_count = 0, // no loop
+	};
+
+	ESP_LOGI(TAG, "install IR NEC encoder");
+	ir_nec_encoder_config_t _nec_encoder_cfg = {
+		.resolution = EXAMPLE_IR_RESOLUTION_HZ,
+	};
+	rmt_encoder_handle_t _nec_encoder = NULL;
+	ESP_ERROR_CHECK(rmt_new_ir_nec_encoder(&_nec_encoder_cfg, &_nec_encoder));
+
+	ESP_LOGI(TAG, "enable RMT TX channels");
+	ESP_ERROR_CHECK(rmt_enable(_tx_channel));
+
+	*tx_channel = _tx_channel;
+	*nec_encoder = _nec_encoder;
+	*transmit_config = _transmit_config;
+}
+
 void tft(void *pvParameters)
 {
 	// Setup IR transmitter
-	rmt_item32_t *items = NULL;
-	size_t length = 0;
-	ir_builder_t *ir_builder = NULL;
-	rmt_config_t rmt_tx_config = RMT_DEFAULT_CONFIG_TX(RMT_TX_GPIO_NUM, RMT_TX_CHANNEL);
-	rmt_tx_config.tx_config.carrier_en = true;
-	rmt_config(&rmt_tx_config);
-	rmt_driver_install(RMT_TX_CHANNEL, 0, 0);
-	ir_builder_config_t ir_builder_config = IR_BUILDER_DEFAULT_CONFIG((ir_dev_t)RMT_TX_CHANNEL);
-	ir_builder_config.flags |= IR_TOOLS_FLAGS_PROTO_EXT;
-	ir_builder = ir_builder_rmt_new_nec(&ir_builder_config);
-	ESP_LOGI(pcTaskGetName(0), "Setup IR transmitter done");
+	rmt_channel_handle_t tx_channel = NULL;
+	rmt_encoder_handle_t nec_encoder = NULL;
+	rmt_transmit_config_t transmit_config = {};
+	initializeRMT(&tx_channel, &nec_encoder, &transmit_config);
 
 	// Read display information
 	DISPLAY_t display[MAX_CONFIG];
@@ -215,16 +301,12 @@ void tft(void *pvParameters)
 			ESP_LOGI(pcTaskGetName(0), "cmd=0x%x",cmd);
 			ESP_LOGI(pcTaskGetName(0), "addr=0x%x",addr);
 
-			// Send new key code
-			ESP_ERROR_CHECK(ir_builder->build_frame(ir_builder, addr, cmd));
-			ESP_ERROR_CHECK(ir_builder->get_result(ir_builder, &items, &length));
-			//To send data according to the waveform items.
-			rmt_write_items(RMT_TX_CHANNEL, items, length, false);
-			// Send repeat code
-			vTaskDelay(pdMS_TO_TICKS(ir_builder->repeat_period_ms));
-			ESP_ERROR_CHECK(ir_builder->build_repeat_frame(ir_builder));
-			ESP_ERROR_CHECK(ir_builder->get_result(ir_builder, &items, &length));
-			rmt_write_items(RMT_TX_CHANNEL, items, length, false);
+			// transmit IR NEC packets
+			const ir_nec_scan_code_t scan_code = {
+				.address = addr,
+				.command = cmd,
+			};
+			ESP_ERROR_CHECK(rmt_transmit(tx_channel, nec_encoder, &scan_code, sizeof(scan_code), &transmit_config));
 
 			if (selected == 0) {
 				selected = 1;
@@ -235,53 +317,21 @@ void tft(void *pvParameters)
 	} // end while
 
 	// nerver reach here
-	ir_builder->del(ir_builder);
-	rmt_driver_uninstall(RMT_TX_CHANNEL);
 	vTaskDelete(NULL);
 }
 
 void app_main(void)
 {
 	ESP_LOGI(TAG, "Initializing SPIFFS");
-	esp_vfs_spiffs_conf_t conf = {
-		.base_path = "/spiffs",
-		.partition_label = NULL,
-		.max_files = 10,
-		.format_if_mount_failed =true
-	};
-
-	// Use settings defined above toinitialize and mount SPIFFS filesystem.
-	// Note: esp_vfs_spiffs_register is anall-in-one convenience function.
-	esp_err_t ret =esp_vfs_spiffs_register(&conf);
-
-	if (ret != ESP_OK) {
-		if (ret ==ESP_FAIL) {
-			ESP_LOGE(TAG, "Failed to mount or format filesystem");
-		} else if (ret== ESP_ERR_NOT_FOUND) {
-			ESP_LOGE(TAG, "Failed to find SPIFFS partition");
-		} else {
-			ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)",esp_err_to_name(ret));
-		}
-		return;
-	}
-
-	size_t total = 0, used = 0;
-	ret = esp_spiffs_info(NULL, &total, &used);
-	if (ret != ESP_OK) {
-		ESP_LOGE(TAG,"Failed to get SPIFFS partition information (%s)",esp_err_to_name(ret));
-	} else {
-		ESP_LOGI(TAG,"Partition size: total: %d, used: %d", total, used);
-	}
-
-	SPIFFS_Directory("/spiffs");
+	ESP_ERROR_CHECK(mountSPIFFS("/spiffs", "storage", 10));
+	listSPIFFS("/spiffs");
 
 	/* Create Queue */
 	xQueueCmd = xQueueCreate( 10, sizeof(CMD_t) );
 	configASSERT( xQueueCmd );
 
-
 	xTaskCreate(tft, "TFT", 1024*4, NULL, 2, NULL);
 
-	xTaskCreate(buttonStick, "BUTTON", 1024*4, NULL, 2, NULL);
+	xTaskCreate(buttonAtom, "BUTTON", 1024*4, NULL, 2, NULL);
 }
 
