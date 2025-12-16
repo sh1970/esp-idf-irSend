@@ -1,6 +1,7 @@
 # esp-idf-irSend
 M5Atom, M5Stick and M5StickC(+) have internal IR Transmitter.   
 You can use these as Remote control transmitter.   
+This project is based on [this](https://github.com/espressif/esp-idf/tree/master/examples/peripherals/rmt/ir_nec_transceiver).   
 
 # Software requirements
 ESP-IDF V5.0 or later.   
