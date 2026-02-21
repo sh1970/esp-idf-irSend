@@ -4,8 +4,8 @@ You can use these as Remote control transmitter.
 This project is based on [this](https://github.com/espressif/esp-idf/tree/master/examples/peripherals/rmt/ir_nec_transceiver).   
 
 # Software requirements
-ESP-IDF V5.0 or later.   
-ESP-IDF V4.4 release branch reached EOL in July 2024.   
+ESP-IDF V5.2 or later.   
+Because this project uses the new I2C driver.   
 
 # How to get IR code.
 You can get IR code using esp-idf-irAnalysis.   
