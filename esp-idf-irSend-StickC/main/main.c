@@ -869,13 +869,13 @@ void app_main(void)
 
 #if CONFIG_STICKC
 	// power on
-	i2c_master_init();
+	AXP192_Initialize(I2C_NUM_0);
 	AXP192_PowerOn();
 #endif
 
 #if CONFIG_STICKC_PLUS
 	// power on
-	i2c_master_init();
+	AXP192_Initialize(I2C_NUM_0);
 	AXP192_PowerOn();
 	AXP192_ScreenBreath(11);
 #endif
